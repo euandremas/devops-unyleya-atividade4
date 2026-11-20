@@ -1,0 +1,43 @@
+name: Atividade 4 - DevOps CI/CD
+
+on:
+  push:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  validar-infraestrutura:
+    name: Validar CloudFormation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Baixar codigo do GitHub
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciais AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::853815796153:role/GitHubActions-Unyleya-DeployRole
+          aws-region: sa-east-1
+          role-session-name: UnyleyaAtividade4
+
+      - name: Confirmar identidade AWS
+        run: aws sts get-caller-identity
+
+      - name: Validar template CloudFormation
+        run: |
+          aws cloudformation validate-template \
+            --template-body file://template.yaml \
+            --region sa-east-1
+
+      - name: Confirmar validacao
+        run: |
+          echo "Autenticacao OIDC realizada."
+          echo "Template CloudFormation validado."
+          echo "Nenhuma infraestrutura foi provisionada."
