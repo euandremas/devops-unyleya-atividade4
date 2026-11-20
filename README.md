@@ -452,7 +452,7 @@ A remoção da infraestrutura não é executada automaticamente pelo workflow at
 
 A apresentação em vídeo foi gravada e demonstra a estrutura do repositório, os trechos principais do `template.yaml` e do `.github/workflows/deploy.yml`, a autenticação OIDC, a validação automática, o deploy manual e o teste de persistência no RDS MySQL.
 
-**Link do vídeo:** a inserir após a publicação da gravação em uma plataforma acessível ao avaliador.
+[**Link do vídeo:**](https://youtu.be/Xrd34CLClEk?utm_source=chatgpt.com)
 
 ### Evidências no GitHub Actions
 
