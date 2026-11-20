@@ -1,0 +1,635 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Atividade 3 - DevOps - Andre Moreira Araujo dos Santos.
+  Laboratorio com EC2, Application Load Balancer e RDS MySQL.
+
+# Este arquivo e autossuficiente: a aplicacao esta embutida no UserData.
+# Laboratorio com cobranca AWS; excluir a pilha ao terminar a demonstracao.
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: Acesso e disponibilidade}
+        Parameters: [AccessCidr, AvailabilityZoneA, AvailabilityZoneB]
+      - Label: {default: Capacidade do laboratorio}
+        Parameters: [EC2InstanceType, DBInstanceClass, LatestAmiId]
+
+Parameters:
+  AccessCidr:
+    Type: String
+    Description: IPv4 publico do seu navegador com /32. Nao use o IP do CloudShell.
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/(3[0-2]|[12]?\d)$'
+    ConstraintDescription: Informe um CIDR IPv4 valido, de preferencia seu IP publico/32.
+  AvailabilityZoneA:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: Primeira zona de disponibilidade da regiao selecionada.
+  AvailabilityZoneB:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: Segunda zona, diferente da primeira.
+  EC2InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small]
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues: [db.t3.micro, db.t3.small]
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Rules:
+  DifferentAvailabilityZones:
+    Assertions:
+      - Assert: !Not [!Equals [!Ref AvailabilityZoneA, !Ref AvailabilityZoneB]]
+        AssertDescription: Escolha duas zonas de disponibilidade diferentes.
+
+Resources:
+  # 1. Rede propria; nao depende da VPC padrao da conta.
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.30.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-vpc'}]
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Ref AvailabilityZoneA
+      CidrBlock: 10.30.1.0/24
+      MapPublicIpOnLaunch: false
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-public-a'}]
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Ref AvailabilityZoneB
+      CidrBlock: 10.30.2.0/24
+      MapPublicIpOnLaunch: false
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-public-b'}]
+  PrivateDbSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Ref AvailabilityZoneA
+      CidrBlock: 10.30.11.0/24
+      MapPublicIpOnLaunch: false
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-db-a'}]
+  PrivateDbSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Ref AvailabilityZoneB
+      CidrBlock: 10.30.12.0/24
+      MapPublicIpOnLaunch: false
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-db-b'}]
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref Vpc}
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicAssociationA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+  PublicAssociationB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+  PrivateDbRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref Vpc}
+  PrivateAssociationA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateDbSubnetA
+      RouteTableId: !Ref PrivateDbRouteTable
+  PrivateAssociationB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateDbSubnetB
+      RouteTableId: !Ref PrivateDbRouteTable
+
+  # 2. Regras entre SGs em recursos separados, evitando dependencia circular.
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTP do IP autorizado para o ALB
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: !Ref AccessCidr}
+      # Regra inerte substitui a saida default; regra efetiva e declarada abaixo.
+      SecurityGroupEgress:
+        - {IpProtocol: tcp, FromPort: 1, ToPort: 1, CidrIp: 127.0.0.1/32}
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Aplicacao recebe somente do ALB; sem SSH
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - {IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0,
+           Description: HTTPS para pacotes e APIs AWS}
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: MySQL recebe somente da aplicacao
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - {IpProtocol: tcp, FromPort: 1, ToPort: 1, CidrIp: 127.0.0.1/32}
+  AlbToAppEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !GetAtt AlbSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 8000
+      ToPort: 8000
+      DestinationSecurityGroupId: !GetAtt AppSecurityGroup.GroupId
+  AppFromAlbIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt AppSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 8000
+      ToPort: 8000
+      SourceSecurityGroupId: !GetAtt AlbSecurityGroup.GroupId
+  AppToDatabaseEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !GetAtt AppSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      DestinationSecurityGroupId: !GetAtt DatabaseSecurityGroup.GroupId
+  DatabaseFromAppIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt DatabaseSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      SourceSecurityGroupId: !GetAtt AppSecurityGroup.GroupId
+
+  # 3. RDS privado; Single-AZ deliberado para o laboratorio.
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Duas sub-redes privadas para o RDS
+      SubnetIds: [!Ref PrivateDbSubnetA, !Ref PrivateDbSubnetB]
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Engine: mysql
+      # O RDS seleciona a versao padrao da regiao; o script faz preflight.
+      EngineLifecycleSupport: open-source-rds-extended-support-disabled
+      DBInstanceClass: !Ref DBInstanceClass
+      DBName: atividade3
+      MasterUsername: labadmin
+      ManageMasterUserPassword: true
+      AllocatedStorage: '20'
+      StorageType: gp3
+      StorageEncrypted: true
+      PubliclyAccessible: false
+      MultiAZ: false
+      AvailabilityZone: !Ref AvailabilityZoneA
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VPCSecurityGroups: [!GetAtt DatabaseSecurityGroup.GroupId]
+      Port: 3306
+      BackupRetentionPeriod: 0
+      DeleteAutomatedBackups: true
+      DeletionProtection: false
+      AutoMinorVersionUpgrade: true
+      CopyTagsToSnapshot: true
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-mysql'}]
+
+  # 4. Role da EC2: SSM, leitura de um segredo e sinal para a propria pilha.
+  AppRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'devops-unyleya-${AWS::StackName}-app'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Policies:
+        - PolicyName: ReadDatabaseSecret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !GetAtt Database.MasterUserSecret.SecretArn
+        - PolicyName: SignalOwnStack
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: cloudformation:SignalResource
+                Resource: !Ref AWS::StackId
+  AppInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub 'devops-unyleya-${AWS::StackName}-profile'
+      Roles: [!Ref AppRole]
+
+  # 5. Bootstrap espera somente localhost/RDS; nao depende do ALB pronto.
+  AppInstance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - PublicDefaultRoute
+      - PublicAssociationA
+      - PrivateAssociationA
+      - AppToDatabaseEgress
+      - DatabaseFromAppIngress
+    CreationPolicy:
+      ResourceSignal: {Count: 1, Timeout: PT20M}
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref EC2InstanceType
+      IamInstanceProfile: !Ref AppInstanceProfile
+      CreditSpecification: {CPUCredits: standard}
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+        HttpPutResponseHopLimit: 1
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          AssociatePublicIpAddress: true
+          DeleteOnTermination: true
+          SubnetId: !Ref PublicSubnetA
+          GroupSet: [!GetAtt AppSecurityGroup.GroupId]
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs: {VolumeSize: 8, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true}
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-app'}]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          export AWS_REGION='${AWS::Region}'
+          export STACK_ID='${AWS::StackId}'
+
+          signal_exit() {
+            exit_code=$?
+            trap - EXIT
+            if [ -x /opt/atividade3/venv/bin/python ]; then
+              /opt/atividade3/venv/bin/python - "$exit_code" <<'SIGNAL_PY' || true
+          import os, sys, boto3
+          from botocore.config import Config
+          client = boto3.client('cloudformation', region_name=os.environ['AWS_REGION'],
+              config=Config(retries={'mode': 'standard', 'max_attempts': 5}))
+          client.signal_resource(StackName=os.environ['STACK_ID'],
+              LogicalResourceId='AppInstance', UniqueId='bootstrap',
+              Status='SUCCESS' if sys.argv[1] == '0' else 'FAILURE')
+          SIGNAL_PY
+            fi
+            exit "$exit_code"
+          }
+          trap signal_exit EXIT
+
+          dnf install -y python3.11 python3.11-pip amazon-ssm-agent
+          id appsvc >/dev/null 2>&1 || useradd --system --shell /sbin/nologin appsvc
+          install -d -m 0755 /opt/atividade3
+          python3.11 -m venv /opt/atividade3/venv
+          /opt/atividade3/venv/bin/pip install --disable-pip-version-check \
+            'boto3==1.44.6' 'PyMySQL==1.2.4'
+          curl --fail --silent --show-error --retry 5 --retry-delay 5 \
+            https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
+            -o /opt/atividade3/global-bundle.pem
+          cat > /opt/atividade3/app.py <<'APP_PY'
+          """Aplicação didática: navegador -> ALB -> EC2 -> RDS MySQL.
+
+          As credenciais são obtidas em tempo de execução, nunca incluídas no template.
+          O servidor HTTP da biblioteca padrão destina-se somente a este laboratório.
+          """
+          import json
+          import logging
+          import os
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          from urllib.parse import urlsplit
+
+          import boto3
+          from botocore.config import Config
+          import pymysql
+
+          LOG = logging.getLogger("atividade3")
+          REGION = os.environ["AWS_REGION"]
+          SECRET_ARN = os.environ["DB_SECRET_ARN"]
+          DB_HOST = os.environ["DB_HOST"]
+          DB_NAME = os.environ["DB_NAME"]
+          DB_PORT = int(os.environ.get("DB_PORT", "3306"))
+          CA_PATH = os.environ.get("DB_CA_PATH", "/opt/atividade3/global-bundle.pem")
+          SECRETS = boto3.client(
+              "secretsmanager", region_name=REGION,
+              config=Config(connect_timeout=5, read_timeout=5,
+                            retries={"mode": "standard", "max_attempts": 2}),
+          )
+
+
+          def connect_db():
+              # Buscar a senha atual a cada conexão acompanha a rotação feita pelo RDS.
+              secret = json.loads(SECRETS.get_secret_value(SecretId=SECRET_ARN)["SecretString"])
+              return pymysql.connect(
+                  host=DB_HOST, port=DB_PORT, database=DB_NAME,
+                  user=secret["username"], password=secret["password"],
+                  ssl_ca=CA_PATH, ssl_verify_cert=True, ssl_verify_identity=True,
+                  connect_timeout=5, read_timeout=5, write_timeout=5,
+                  charset="utf8mb4", autocommit=True,
+                  cursorclass=pymysql.cursors.DictCursor,
+              )
+
+
+          def initialize_db():
+              with connect_db() as connection:
+                  with connection.cursor() as cursor:
+                      cursor.execute("""
+                          CREATE TABLE IF NOT EXISTS registros_demo (
+                              id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                              descricao VARCHAR(120) NOT NULL,
+                              criado_em TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                          ) ENGINE=InnoDB
+                      """)
+
+
+          def query_db():
+              with connect_db() as connection:
+                  with connection.cursor() as cursor:
+                      cursor.execute("SELECT DATABASE() AS banco, VERSION() AS versao, "
+                                     "CURRENT_TIMESTAMP AS horario_banco")
+                      result = cursor.fetchone()
+                      cursor.execute("SHOW SESSION STATUS LIKE 'Ssl_cipher'")
+                      tls = cursor.fetchone()
+                      result["tls_cipher"] = tls["Value"] if tls else ""
+                      if not result["tls_cipher"]:
+                          raise RuntimeError("Conexao sem TLS")
+                      cursor.execute("SELECT COUNT(*) AS total FROM registros_demo")
+                      result["total_registros"] = cursor.fetchone()["total"]
+                      cursor.execute("SELECT id, descricao, criado_em FROM registros_demo "
+                                     "ORDER BY id DESC LIMIT 5")
+                      result["ultimos_registros"] = cursor.fetchall()
+              result["status"] = "ok"
+              return result
+
+
+          def insert_demo():
+              with connect_db() as connection:
+                  with connection.cursor() as cursor:
+                      cursor.execute("INSERT INTO registros_demo (descricao) VALUES (%s)",
+                                     ("Registro ficticio da demonstracao de IaC",))
+                      record_id = cursor.lastrowid
+              return {"status": "ok", "id": record_id, "mensagem": "Registro gravado no RDS."}
+
+
+          PAGE = r'''<!doctype html>
+          <html lang="pt-BR"><head><meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>Atividade 3 | Infraestrutura como código</title>
+          <style>
+          :root{color-scheme:light;font-family:system-ui,sans-serif;color:#172d40;background:#edf2f6}
+          *{box-sizing:border-box}body{margin:0}main{max-width:1040px;margin:48px auto;padding:0 24px}
+          .eyebrow{font-size:13px;letter-spacing:.13em;text-transform:uppercase;color:#526a80}
+          h1{font-size:clamp(28px,4vw,44px);line-height:1.15;margin:12px 0}h2{font-size:20px;margin-top:0}
+          p{line-height:1.65}.lead{max-width:780px;color:#465e72}.flow{display:flex;gap:12px;margin:28px 0;align-items:center}
+          .node{background:#fff;border:1px solid #cad6df;border-radius:12px;padding:20px;flex:1}
+          .node small{display:block;margin-top:8px;color:#526a80}.arrow{color:#157865;font-weight:800}
+          .panel{background:#fff;border:1px solid #cad6df;border-radius:14px;padding:24px;margin-top:20px}
+          .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}.badge{padding:6px 10px;border-radius:20px;background:#e9eef3;font-size:13px}
+          button{border:0;background:#146b62;color:white;padding:12px 18px;border-radius:7px;font:inherit;font-weight:600;cursor:pointer}
+          button.secondary{background:#e8eef4;color:#172d40}button:disabled{opacity:.5;cursor:wait}
+          .status{min-height:26px;color:#526a80}.ok{color:#146b62}.error{color:#a12d2d}
+          dl{display:grid;grid-template-columns:180px 1fr;gap:8px 18px;margin:18px 0}dt{color:#526a80}dd{margin:0;overflow-wrap:anywhere}
+          table{border-collapse:collapse;width:100%;font-size:14px}th,td{text-align:left;padding:12px 8px;border-bottom:1px solid #e2e8ee}
+          .table-wrap{overflow:auto}footer{font-size:13px;color:#526a80;padding:20px 0}
+          @media(max-width:640px){main{margin-top:24px}.flow{flex-direction:column}.node{width:100%}.arrow{transform:rotate(90deg)}dl{grid-template-columns:1fr}dd{margin-bottom:8px}}
+          </style></head><body><main>
+          <div class="eyebrow">DevOps · Unidade III · André Moreira Araújo dos Santos</div>
+          <h1>Infraestrutura definida em código.<br>Integração demonstrada na prática.</h1>
+          <p class="lead">Esta aplicação de laboratório permite verificar o caminho da requisição e a persistência de dados no Amazon RDS. As informações do painel são consultadas no banco.</p>
+          <div class="flow" aria-label="Fluxo: ALB, EC2 e RDS">
+          <div class="node"><b>01 · Application Load Balancer</b><small>Entrada pelo endereço da aplicação</small></div><span class="arrow">→</span>
+          <div class="node"><b>02 · Amazon EC2</b><small>Aplicação Python em Linux</small></div><span class="arrow">→</span>
+          <div class="node"><b>03 · Amazon RDS</b><small>MySQL privado · conexão TLS</small></div>
+          </div>
+          <section class="panel"><div class="row"><h2>Consulta ao banco</h2><span class="badge" id="badge">Aguardando verificação</span></div>
+          <p>Consulte o banco, grave um registro fictício e consulte novamente para conferir a persistência.</p>
+          <div class="row"><button id="refresh">Consultar banco</button><button id="insert" class="secondary">Gravar registro de teste</button></div>
+          <p id="status" class="status" role="status" aria-live="polite">Aguardando consulta.</p>
+          <dl><dt>Banco consultado</dt><dd id="database">—</dd><dt>Versão do MySQL</dt><dd id="version">—</dd>
+          <dt>Horário do banco</dt><dd id="time">—</dd><dt>Cifra TLS</dt><dd id="tls">—</dd><dt>Total de registros</dt><dd id="total">—</dd></dl>
+          <div class="table-wrap"><table><thead><tr><th>ID</th><th>Descrição</th><th>Criado em</th></tr></thead><tbody id="records"></tbody></table></div>
+          </section><footer>Laboratório acadêmico · Dados fictícios · Acesso HTTP restrito ao IP informado na implantação. A conexão da aplicação ao RDS utiliza TLS validado.</footer>
+          </main><script>
+          const byId = id => document.getElementById(id);
+          function setBusy(busy) { byId('refresh').disabled=busy; byId('insert').disabled=busy; }
+          async function request(path, method='GET') {
+            const response=await fetch(path,{method,cache:'no-store',headers:{'X-Demo-Request':'1'}});
+            const body=await response.json();
+            if(!response.ok) throw new Error(body.mensagem || 'Falha na requisição.');
+            return body;
+          }
+          async function loadData() {
+            const data=await request('/api/db');
+            byId('database').textContent=data.banco; byId('version').textContent=data.versao;
+            byId('time').textContent=data.horario_banco; byId('tls').textContent=data.tls_cipher;
+            byId('total').textContent=data.total_registros;
+            byId('records').replaceChildren();
+            for(const record of data.ultimos_registros) {
+              const row=document.createElement('tr');
+              for(const value of [record.id,record.descricao,record.criado_em]) {
+                const cell=document.createElement('td'); cell.textContent=value; row.append(cell);
+              }
+              byId('records').append(row);
+            }
+            byId('badge').textContent='Consulta real concluída';
+          }
+          async function run(insert=false) {
+            setBusy(true); byId('status').className='status'; byId('status').textContent='Consultando a aplicação e o banco…';
+            try {
+              let message='Consulta ao RDS concluída com TLS.';
+              if(insert) { const result=await request('/api/registro','POST'); message='Registro '+result.id+' gravado e consultado no RDS.'; }
+              await loadData(); byId('status').textContent=message; byId('status').className='status ok';
+            } catch(error) {
+              byId('badge').textContent='Falha na verificação';
+              byId('status').textContent=error.message; byId('status').className='status error';
+            } finally { setBusy(false); }
+          }
+          byId('refresh').addEventListener('click',()=>run());
+          byId('insert').addEventListener('click',()=>run(true));
+          run();
+          </script></body></html>'''
+
+
+          class Handler(BaseHTTPRequestHandler):
+              server_version = "Atividade3"
+
+              def send_body(self, status, body, content_type="application/json; charset=utf-8"):
+                  payload = body.encode("utf-8")
+                  self.send_response(status)
+                  self.send_header("Content-Type", content_type)
+                  self.send_header("Content-Length", str(len(payload)))
+                  self.send_header("Cache-Control", "no-store")
+                  self.send_header("X-Content-Type-Options", "nosniff")
+                  self.send_header("X-Frame-Options", "DENY")
+                  self.end_headers()
+                  self.wfile.write(payload)
+
+              def send_json(self, status, data):
+                  self.send_body(status, json.dumps(data, ensure_ascii=False, default=str))
+
+              def db_operation(self, function):
+                  try:
+                      self.send_json(200, function())
+                  except Exception as error:
+                      # Nunca retornar senha, segredo ou exceção completa ao navegador/log.
+                      LOG.error("Operacao de banco falhou: %s", type(error).__name__)
+                      self.send_json(503, {"status": "erro", "mensagem":
+                          "Banco indisponível. Consulte o serviço e os eventos da implantação."})
+
+              def do_GET(self):
+                  path = urlsplit(self.path).path
+                  if path == "/":
+                      self.send_body(200, PAGE, "text/html; charset=utf-8")
+                  elif path == "/health":
+                      self.send_json(200, {"status": "ok", "componente": "aplicacao-ec2"})
+                  elif path == "/api/db":
+                      self.db_operation(query_db)
+                  else:
+                      self.send_json(404, {"mensagem": "Rota não encontrada."})
+
+              def do_POST(self):
+                  if urlsplit(self.path).path != "/api/registro":
+                      self.send_json(404, {"mensagem": "Rota não encontrada."})
+                  elif self.headers.get("X-Demo-Request") != "1":
+                      self.send_json(403, {"mensagem": "Requisição não autorizada."})
+                  else:
+                      self.db_operation(insert_demo)
+
+
+          if __name__ == "__main__":
+              logging.basicConfig(level=logging.INFO)
+              try:
+                  initialize_db()
+              except Exception as error:
+                  LOG.error("Inicializacao falhou: %s", type(error).__name__)
+                  raise SystemExit(1)
+              LOG.info("Aplicacao pronta na porta 8000.")
+              ThreadingHTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
+          APP_PY
+          cat > /etc/atividade3.env <<'APP_ENV'
+          AWS_REGION=${AWS::Region}
+          DB_HOST=${Database.Endpoint.Address}
+          DB_PORT=${Database.Endpoint.Port}
+          DB_NAME=atividade3
+          DB_SECRET_ARN=${Database.MasterUserSecret.SecretArn}
+          APP_ENV
+          chown root:appsvc /etc/atividade3.env
+          chmod 0640 /etc/atividade3.env
+          chmod 0644 /opt/atividade3/app.py /opt/atividade3/global-bundle.pem
+          cat > /etc/systemd/system/atividade3.service <<'APP_SERVICE'
+          [Unit]
+          Description=Aplicacao didatica DevOps Atividade 3
+          Wants=network-online.target
+          After=network-online.target
+          StartLimitIntervalSec=0
+          [Service]
+          Type=simple
+          User=appsvc
+          Group=appsvc
+          EnvironmentFile=/etc/atividade3.env
+          WorkingDirectory=/opt/atividade3
+          ExecStart=/opt/atividade3/venv/bin/python -u /opt/atividade3/app.py
+          Restart=on-failure
+          RestartSec=10
+          NoNewPrivileges=true
+          PrivateTmp=true
+          ProtectSystem=strict
+          ProtectHome=true
+          UMask=0027
+          [Install]
+          WantedBy=multi-user.target
+          APP_SERVICE
+          systemctl daemon-reload
+          systemctl enable --now amazon-ssm-agent
+          systemctl enable --now atividade3
+          # Provar SELECT real antes de sinalizar sucesso; nao consultar ALB aqui.
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --max-time 20 http://127.0.0.1:8000/api/db >/dev/null; then
+              exit 0
+            fi
+            sleep 10
+          done
+          exit 1
+
+  # 6. O ALB atende em duas AZs e encaminha para a unica EC2 solicitada.
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: [PublicDefaultRoute, PublicAssociationA, PublicAssociationB, AlbToAppEgress]
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      SecurityGroups: [!GetAtt AlbSecurityGroup.GroupId]
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      LoadBalancerAttributes:
+        - {Key: routing.http.drop_invalid_header_fields.enabled, Value: 'true'}
+  AppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: AppFromAlbIngress
+    Properties:
+      VpcId: !Ref Vpc
+      Protocol: HTTP
+      Port: 8000
+      TargetType: instance
+      Targets: [{Id: !Ref AppInstance, Port: 8000}]
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: {HttpCode: '200'}
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions: [{Type: forward, TargetGroupArn: !Ref AppTargetGroup}]
+
+Outputs:
+  ApplicationURL:
+    Description: Abra no navegador cujo IP foi informado em AccessCidr.
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+  DbCheckURL:
+    Description: Consulta JSON real ao banco, pela aplicacao atras do ALB.
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}/api/db'
+  InstanceId:
+    Value: !Ref AppInstance
+  DatabaseId:
+    Value: !Ref Database
+  TargetGroupArn:
+    Value: !Ref AppTargetGroup
+  VpcId:
+    Value: !Ref Vpc
+  LabNotice:
+    Value: Laboratorio cobrado. A exclusao da pilha remove os dados de teste.
