@@ -40,4 +40,34 @@ jobs:
         run: |
           echo "Autenticacao OIDC realizada."
           echo "Template CloudFormation validado."
-          echo "Nenhuma infraestrutura foi provisionada."
+
+      - name: Deploy CloudFormation
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          ACCESS_CIDR: ${{ vars.ACCESS_CIDR }}
+        run: |
+          test -n "$ACCESS_CIDR" || {
+            echo "ERRO: Variavel ACCESS_CIDR nao configurada."
+            exit 1
+          }
+
+          aws cloudformation deploy \
+            --template-file template.yaml \
+            --stack-name unyleya-lab4 \
+            --region sa-east-1 \
+            --role-arn arn:aws:iam::853815796153:role/DevOps-Unyleya-CloudFormationRole \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --parameter-overrides \
+              AccessCidr="$ACCESS_CIDR" \
+              AvailabilityZoneA=sa-east-1a \
+              AvailabilityZoneB=sa-east-1b \
+            --no-fail-on-empty-changeset
+
+      - name: Confirmar resultado do deploy
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          aws cloudformation describe-stacks \
+            --stack-name unyleya-lab4 \
+            --region sa-east-1 \
+            --query 'Stacks[0].[StackName,StackStatus]' \
+            --output table
